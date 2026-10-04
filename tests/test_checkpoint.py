@@ -18,6 +18,10 @@
 - 持久化：reset_playback（模拟进程重启）后原会话 404，存档仍可恢复；
   存档落在 SCENES_DB_PATH 的同一 SQLite。
 - 旧接口响应不变。
+- 可控交错回归（保存与同会话操作的串行）：保存遇 SQLite 写锁等待时
+  同会话推进不得先完成、提交前恢复 404、写锁释放后保存先完成且恢复
+  与保存响应一致；写库提交失败回滚、不留存档、不改会话或通道容量并
+  释放等待操作；正常保存的可控交错（三种保存路由）。
 """
 import threading
 
@@ -709,3 +713,252 @@ def test_legacy_responses_unchanged():
     client.post(f"/sessions/{sid2}/channel")
     fetch_body = fetch(client, sid2, 0).json()
     assert set(fetch_body) == {"session_id", "scene_id", "acked_seq", "events"}
+
+
+# ---------------------------------------------------------------------------
+# 可控交错回归：等写锁、提交失败与正常保存
+#
+# 修复前：序列化在会话锁内完成，但 SQLite 提交在锁外——保存等待写锁期间，
+# 同会话的推进可以先完成，而落库的仍是交错前的旧快照（保存响应在后、
+# 内容却是旧游标）。修复后：资格检查、状态采集与 SQLite 提交在同一次
+# 会话锁持锁内完成——保存等待期间同会话操作不得先完成；写入失败回滚、
+# 不留存档、不改会话或通道容量，并释放等待中的操作。
+# ---------------------------------------------------------------------------
+
+
+def _patch_save_gate(monkeypatch, entered, release, fail_with=None):
+    """故障注入：在存档写库边界受控暂停（仅暂停第一次调用）。
+
+    保存线程进入写库调用时（此时它持有会话锁）置位 entered，随后阻塞
+    到 release 被置位；fail_with 非空时放行后抛该异常（模拟写锁等待
+    超时等提交失败），否则调用真正的 save_checkpoint 完成落库。
+    """
+    store = main_module.get_store()
+    real_save = store.save_checkpoint
+    calls = []
+
+    def wrapped_save_checkpoint(*args, **kwargs):
+        if not calls:
+            calls.append((args, kwargs))
+            entered.set()
+            assert release.wait(timeout=10), "测试未及时放行被暂停的写库"
+            if fail_with is not None:
+                raise fail_with
+        return real_save(*args, **kwargs)
+
+    monkeypatch.setattr(store, "save_checkpoint", wrapped_save_checkpoint)
+    return calls
+
+
+def test_save_waits_for_sqlite_write_lock_same_session_ops_queue(monkeypatch):
+    """保存遇 SQLite 写锁等待：同会话推进不得先完成，提交前恢复 404。
+
+    回归（修复前）：序列化在会话锁内、SQLite 提交在锁外——游标 1000 的
+    保存等待写锁期间，推进到 3000 先完成，保存随后成功落库的却仍是
+    游标 1000 的旧快照（保存响应在后、内容却是交错前的状态）。修复后
+    资格检查、状态采集与 SQLite 提交在同一次会话锁持锁内完成：写锁
+    释放后保存先完成（游标 1000），推进随后生效（3000），恢复得到与
+    保存响应一致的 1000。
+    """
+    import os
+    import sqlite3
+
+    client = make_client()
+    sid = prep_session_with_queued_events(client, "scene-cp-wlock")
+
+    # 另一个写入者持有 SQLite 写锁（模拟并发写）：保存的 BEGIN IMMEDIATE
+    # 将在 busy_timeout 内一直等待，直到本连接回滚释放
+    db_path = os.environ["SCENES_DB_PATH"]
+    lock_conn = sqlite3.connect(db_path)
+    lock_conn.execute("BEGIN IMMEDIATE")
+
+    entered = threading.Event()
+    release = threading.Event()
+    _patch_save_gate(monkeypatch, entered, release)
+
+    outcomes = {}
+
+    def do_save():
+        c = make_client()
+        outcomes["save"] = save_cp(c, sid, "cp-wlock")
+
+    def do_advance():
+        c = make_client()
+        outcomes["advance"] = events(c, sid, 3000)
+
+    saver = threading.Thread(target=do_save)
+    advancer = threading.Thread(target=do_advance)
+    started = False
+    saver.start()
+    try:
+        assert entered.wait(timeout=10), "保存线程未进入写库调用"
+        release.set()  # 放行进入真正的写库：将阻塞在写锁上
+        advancer.start()
+        started = True
+        advancer.join(timeout=1.0)
+        # 保存持会话锁等写锁期间，同会话推进不得先完成
+        assert advancer.is_alive(), "保存等待写锁期间，同会话推进不应先完成"
+        # 保存尚未提交：恢复按未知存档处理
+        assert restore(client, "cp-wlock").status_code == 404
+    finally:
+        # 释放写锁：保存先完成（游标 1000），推进随后生效（3000）
+        release.set()
+        lock_conn.rollback()
+        lock_conn.close()
+        saver.join(timeout=10)
+        if started:
+            advancer.join(timeout=10)
+    assert not saver.is_alive() and not advancer.is_alive()
+
+    save_resp = outcomes["save"]
+    assert save_resp.status_code == 200
+    assert save_resp.json()["cursor_ms"] == 1000
+    assert save_resp.json()["next_seq"] == 4
+    adv_resp = outcomes["advance"]
+    assert adv_resp.status_code == 200
+    assert adv_resp.json()["cursor_ms"] == 3000
+
+    # 恢复得到与保存响应一致的游标 1000（而非交错后的 3000）
+    body = restore(client, "cp-wlock").json()
+    assert body["cursor_ms"] == 1000
+    assert body["channel"]["queued_count"] == 3
+
+
+def test_save_write_failure_rolls_back_and_releases_waiting_ops(monkeypatch):
+    """写库提交失败：回滚、不留存档、不改会话或通道容量，等待操作被释放。
+
+    模拟写锁等待超时（busy_timeout 耗尽抛 OperationalError）：保存请求
+    失败（500），恢复 404（不留存档）；排队等待的同会话推进随锁释放
+    照常完成；会话与通道容量不因失败改变；同一 checkpoint_id 可立即
+    重试成功。
+    """
+    import sqlite3
+
+    client = make_client()
+    sid = prep_session_with_queued_events(client, "scene-cp-fail")
+    pb = main_module.get_playback()
+    assert pb.channel_capacity.used == 3
+
+    entered = threading.Event()
+    release = threading.Event()
+    _patch_save_gate(
+        monkeypatch,
+        entered,
+        release,
+        fail_with=sqlite3.OperationalError("database is locked"),
+    )
+
+    outcomes = {}
+
+    def do_save():
+        c = TestClient(app, raise_server_exceptions=False)
+        outcomes["save"] = c.put(f"/sessions/{sid}/checkpoints/cp-fail")
+
+    def do_advance():
+        c = make_client()
+        outcomes["advance"] = events(c, sid, 3000)
+
+    saver = threading.Thread(target=do_save)
+    advancer = threading.Thread(target=do_advance)
+    started = False
+    saver.start()
+    try:
+        assert entered.wait(timeout=10), "保存线程未进入写库调用"
+        advancer.start()
+        started = True
+        advancer.join(timeout=1.0)
+        # 保存持锁期间，同会话推进不得先完成
+        assert advancer.is_alive(), "保存写库期间，同会话推进不应先完成"
+        release.set()  # 放行：写库抛 OperationalError（提交失败）
+    finally:
+        release.set()
+        saver.join(timeout=10)
+        if started:
+            advancer.join(timeout=10)
+    assert not saver.is_alive() and not advancer.is_alive()
+
+    # 保存失败：500；不留存档（恢复 404）
+    assert outcomes["save"].status_code == 500
+    assert restore(client, "cp-fail").status_code == 404
+    # 等待中的推进被释放并照常完成：会话未被失败破坏
+    assert outcomes["advance"].status_code == 200
+    assert outcomes["advance"].json()["cursor_ms"] == 3000
+    # 通道容量只反映真实入队（3 + 推进新增 2），失败的保存不泄漏
+    assert pb.channel_capacity.used == 5
+
+    # 同一 checkpoint_id 可立即重试成功（失败未留下任何占用）
+    resp = save_cp(client, sid, "cp-fail")
+    assert resp.status_code == 200
+    assert resp.json()["cursor_ms"] == 3000
+    body = restore(client, "cp-fail").json()
+    assert body["cursor_ms"] == 3000
+    assert body["channel"]["queued_count"] == 5
+
+
+@pytest.mark.parametrize("route", ["put", "post", "collection"])
+def test_save_commits_while_advance_waits_then_advance_proceeds(
+    monkeypatch, route
+):
+    """正常保存的可控交错：保存持锁写库期间推进排队，放行后保存先提交。
+
+    三种保存路由（PUT/POST 具名、集合式 POST）共用同一串行路径：保存
+    以游标 1000 落库后推进才生效到 3000；恢复得到保存时的 1000；推进
+    后的会话状态（游标 3000、队列 5 条）不受影响。
+    """
+    client = make_client()
+    sid = prep_session_with_queued_events(client, "scene-cp-order-" + route)
+
+    entered = threading.Event()
+    release = threading.Event()
+    _patch_save_gate(monkeypatch, entered, release)
+
+    outcomes = {}
+
+    def do_save():
+        c = make_client()
+        if route == "collection":
+            outcomes["save"] = save_cp(c, sid, "cp-order", collection=True)
+        else:
+            outcomes["save"] = save_cp(c, sid, "cp-order", method=route)
+
+    def do_advance():
+        c = make_client()
+        outcomes["advance"] = events(c, sid, 3000)
+
+    saver = threading.Thread(target=do_save)
+    advancer = threading.Thread(target=do_advance)
+    started = False
+    saver.start()
+    try:
+        assert entered.wait(timeout=10), "保存线程未进入写库调用"
+        advancer.start()
+        started = True
+        advancer.join(timeout=1.0)
+        assert advancer.is_alive(), "保存写库期间，同会话推进不应先完成"
+        # 保存尚未提交：恢复按未知存档处理
+        assert restore(client, "cp-order").status_code == 404
+        release.set()  # 放行：保存正常提交
+    finally:
+        release.set()
+        saver.join(timeout=10)
+        if started:
+            advancer.join(timeout=10)
+    assert not saver.is_alive() and not advancer.is_alive()
+
+    # 保存以游标 1000 落库，推进随后生效到 3000
+    save_resp = outcomes["save"]
+    assert save_resp.status_code == 200
+    assert save_resp.json()["cursor_ms"] == 1000
+    assert save_resp.json()["next_seq"] == 4
+    adv_resp = outcomes["advance"]
+    assert adv_resp.status_code == 200
+    assert adv_resp.json()["cursor_ms"] == 3000
+
+    # 恢复得到保存时的状态：游标 1000、3 条未确认事件
+    body = restore(client, "cp-order").json()
+    assert body["cursor_ms"] == 1000
+    assert body["channel"]["queued_count"] == 3
+    assert body["channel"]["next_seq"] == 4
+    # 原会话推进到 3000 后队列累计 5 条，与存档互不影响
+    resp = fetch(client, sid, 0)
+    assert len(resp.json()["events"]) == 5

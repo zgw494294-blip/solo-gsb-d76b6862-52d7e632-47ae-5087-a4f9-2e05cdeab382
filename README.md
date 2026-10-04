@@ -13,7 +13,7 @@
 - 已保存场景可创建**播放会话（session）**：单进程内存态会话复制场景完整快照，游标从 0 毫秒开始推进（只能不减）；播放中可接纳场景的后续修订——已开始（`start_ms` ≤ 游标）的字幕保持原分轨，其余字幕按原最少换轨与并列规则重算。会话不跨重启保留。接纳是完整操作：场景读取、已开始字幕校验、分轨重算与会话替换在会话锁内串行生效，迟到的接纳请求读到的是轮到它生效时的场景快照，不会把会话回写到旧版本。除原 `/advance` 外，另有 `/events` 事件推进：一次推进返回跨过的**全部**字幕进入/退出事件，短字幕即使在两次采样之间开始又结束也不会漏掉。播放时还可通过 `/hidden_speakers` **临时隐藏指定说话人的字幕（仅影响该会话、不持久化）**：按 `speaker` 精确匹配，提交无重复非空字符串数组（空数组清除，允许尚未出现者）；切换时以当前游标的左闭右开活动区间判定，原可见而现隐藏者发 `exit`、原隐藏而现可见者发 `enter`（时刻为当前游标，先 `exit` 后 `enter`，同类按会话字幕顺序，无变化则无事件）；设置后推进与事件推进的活动字幕、事件均排除隐藏者而游标照常推进，隐藏默认空、接纳后保留，完整快照与分轨不受影响。播放结束以 `POST /sessions/{id}/finish` **一次完整操作取回最终快照并释放会话**：成功响应沿用创建会话的全部字段，快照取自轮到结束时的会话（不读取尚未接纳的场景修订），未知会话返回 404；结束与同会话的推进、事件推进、隐藏切换、接纳串行生效，并发结束最多一次成功，结束后针对该 id 的一切请求（含已取得会话引用但尚未生效的请求）均返回 404；不改动源场景、其他会话或此前返回的快照，不保存结束记录、不跨重启恢复。
 - 播放会话可开启一个**补取通道（channel）**，让显示端在**推进响应丢失后仍能补取未确认的字幕变更**：`POST /sessions/{id}/channel` 每会话开启一个内存通道（重复开启 409），返回当前可见 `active` 与序号 0；此后普通推进、事件推进与隐藏切换产生的全部 enter/exit 按事件字段与排序入队，`seq` 从 1 连续编号，短字幕不漏记，接纳不重写已排队内容。`POST /sessions/{id}/channel/fetch` 提交 `ack_seq`（严格非负整数，拒绝布尔值与字符串）补取：只能确认此前补取已返回的最大 `seq` 以内的前缀（越界 422，旧确认不回退），返回确认位置与剩余未确认事件（按 `seq` 递增，重复补取内容与序号不变）。状态变更与入队一同生效，开启、补取与既有会话操作完整串行，失败不改会话或通道；结束会话清除通道，未知或已结束会话、未开启通道均 404。通道仅内存态：不跨重启恢复、不做后台推送，旧接口响应不变。**通道共享容量**由环境变量 `CHANNEL_EVENT_LIMIT` 配置（正整数，默认 1024，非法配置拒绝启动，可在 Compose 中配置）：它是**单进程内所有会话未确认事件总量**的上限。普通推进、事件推进与隐藏切换须按**本次实际生成的事件数**原子申请共享容量，申请与状态变更、`seq` 分配、完整入队一同生效；容量不足立即返回 **503**——不推进游标、不改变隐藏集合、不消费 `seq`、不部分入队。**未开启通道的操作不占容量**；**无事件的操作在满额时仍可执行**。容量**仅在补取确认并删除前缀时**按删除数量释放（纯读取与旧确认不释放），或在**结束会话时释放该通道剩余队列**（重复/并发结束不重复释放）；释放后被 503 拒绝的原请求可原样重试。
 - 已开启补取通道的会话还可启动**自动播放（autoplay）**：客户端不再逐次提交推进时间，进程内后台驱动**每 50 毫秒**按真实经过时间自动推进，目标为**本段起始游标 + 单调时钟经过的整毫秒**（`time.monotonic`，毫秒取整）。HTTP 接口按 `session_id` **启动 / 暂停 / 恢复 / 查询**，返回 `idle`（未启动）/ `running`（运行）/ `paused`（暂停）/ `blocked`（满额阻塞）状态与当前游标。启动仅限**已开补取通道且从未启动**的会话（未开通道或已启动返回 409）；暂停仅限 running，恢复仅限 paused 或 blocked，其余状态迁移均 409；未知或已结束会话 404。**暂停、阻塞不计时**，恢复以保留游标作为新一段起点重新计时，**不追赶**停顿时间；启动与恢复的计时段起点在**会话锁内、控制请求串行生效的同一时刻**读取——同会话接纳等操作持锁时，控制请求在锁外等待的间隔不计入计时，生效后不会把等锁时长额外推进到游标上、也不会提前入队字幕事件。后台推进沿用事件窗口、隐藏过滤、排序、`seq` 与共享容量的**全部既有规则**：一次推进的整批事件原子入队，共享容量不足时整批转为 `blocked`——游标、`seq` 与队列保持原样；确认释放容量后**必须显式恢复**才继续，且不追赶停顿。**运行中两种手动推进（`/advance`、`/events`）返回 409**，未启动/暂停/阻塞时仍可手动推进；隐藏切换、接纳、补取等其他既有会话操作在四种状态下仍可用并与后台推进完整串行。暂停返回后在途后台任务进锁即见非 running，不可能再推进；结束会话即停止对它的驱动（注册表移除后旧任务取不到它）、按原规则释放通道容量，之后该 id 一切请求 404。自动播放驱动状态**仅存单进程内存**，不跨重启，旧接口的请求与响应完全不变。
-- 已开补取通道、自动播放未在运行的播放会话还可保存**播放存档（checkpoint）**以支持**跨重启续播**：`PUT /sessions/{id}/checkpoints/{checkpoint_id}`（或集合式 `POST /sessions/{id}/checkpoints`）按 `session_id` 与非空 `checkpoint_id` 把存档写入场景同一个 SQLite；仅**已开通道且自动播放处于非运行状态**（idle/paused/blocked）可保存，未开通道或运行中返回 **409**。存档在会话锁内序列化，含**完整快照、游标、隐藏集合、通道未确认事件及 `next_seq`、`acked_seq`、`max_returned_seq`** 序号边界，与同会话操作串行；成功**不结束会话**，失败不留存档（同名存档 **409**、未知会话 **404**、非法 id **422**）。`POST /checkpoints/{checkpoint_id}/restore` 按存档恢复为**全新 `session_id`** 的会话，**不读取当前场景**；事件、序号与确认边界保留，后续新事件接着 `next_seq` 连续编号；未启动者恢复后仍未启动，暂停或阻塞者恢复为**暂停**（显式恢复才续播，**重新计时、不追赶离线时间**）。队列按存档未确认事件数**计入共享容量**，容量不足返回 **503** 且不留会话或容量占用，并发恢复不可能超额。同一份存档可**重复恢复**为互不影响的独立会话，恢复及后续操作都不修改存档或其他会话；恢复响应含新会话 id、完整快照与播放状态。旧接口的请求与响应完全不变。
+- 已开补取通道、自动播放未在运行的播放会话还可保存**播放存档（checkpoint）**以支持**跨重启续播**：`PUT /sessions/{id}/checkpoints/{checkpoint_id}`（或集合式 `POST /sessions/{id}/checkpoints`）按 `session_id` 与非空 `checkpoint_id` 把存档写入场景同一个 SQLite；仅**已开通道且自动播放处于非运行状态**（idle/paused/blocked）可保存，未开通道或运行中返回 **409**。存档的**资格检查、状态采集与 SQLite 提交在同一次会话锁持锁内完成**，存档含**完整快照、游标、隐藏集合、通道未确认事件及 `next_seq`、`acked_seq`、`max_returned_seq`** 序号边界：写库等待（如 SQLite 写锁被其他写入占用）期间同会话操作不会先完成，写入失败回滚、不留存档、不改会话或通道容量并释放等待中的操作；成功**不结束会话**，失败不留存档（同名存档 **409**、未知会话 **404**、非法 id **422**）。`POST /checkpoints/{checkpoint_id}/restore` 按存档恢复为**全新 `session_id`** 的会话，**不读取当前场景**；事件、序号与确认边界保留，后续新事件接着 `next_seq` 连续编号；未启动者恢复后仍未启动，暂停或阻塞者恢复为**暂停**（显式恢复才续播，**重新计时、不追赶离线时间**）。队列按存档未确认事件数**计入共享容量**，容量不足返回 **503** 且不留会话或容量占用，并发恢复不可能超额。同一份存档可**重复恢复**为互不影响的独立会话，恢复及后续操作都不修改存档或其他会话；恢复响应含新会话 id、完整快照与播放状态。旧接口的请求与响应完全不变。
 
 ## 一条命令启动
 
@@ -1898,8 +1898,8 @@ curl -s -o /dev/null -X POST http://localhost:8080/sessions/$SID/finish
 | `/sessions/{session_id}/checkpoints` | POST | 请求体 `{"checkpoint_id": "..."}`，语义相同 |
 
 - 仅**已开启补取通道且自动播放不处于运行状态**的会话可以保存：自动播放状态为 `idle`（从未启动）、`paused`（已暂停）、`blocked`（满额阻塞）都允许；**未开通道**（`detail.reason: "channel_missing"`）或**运行中**（`detail.reason: "autoplay_running"`，请先暂停）返回 **409**。
-- 存档与同会话的推进、事件推进、隐藏切换、接纳、补取等操作在**会话锁内完整串行**，因此落库的完整快照（字幕/分轨/`changes`/`source_revision`）、游标、隐藏集合、通道未确认事件与 `next_seq`/`acked_seq`/`max_returned_seq` 是同一份一致状态。
-- 保存**成功不结束会话**：原会话、游标、隐藏集合与通道队列完全不变，可以继续播放或用别的 `checkpoint_id` 再次保存。保存**失败不留存档**，也不改变会话或通道容量。
+- 存档的**资格检查、状态采集与 SQLite 提交（`BEGIN IMMEDIATE` 占用 `checkpoint_id`）在同一次会话锁持锁内完成**，与同会话的推进、事件推进、隐藏切换、接纳、补取等操作完整串行：落库的完整快照（字幕/分轨/`changes`/`source_revision`）、游标、隐藏集合、通道未确认事件与 `next_seq`/`acked_seq`/`max_returned_seq` 是同一份一致状态。**写库等待（如 SQLite 写锁被其他写入占用）期间，同会话操作不会先完成**——它们在会话锁外排队，直到本次存档完全生效或失败；因此保存响应落库的内容不会被同会话的穿插操作插队（见下文“修复说明”与“示例 35”）。
+- 保存**成功不结束会话**：原会话、游标、隐藏集合与通道队列完全不变，可以继续播放或用别的 `checkpoint_id` 再次保存。保存**失败不留存档**（写入失败由存储层回滚），也不改变会话或通道容量，等待中的同会话操作随锁释放照常继续。
 - 状态码：成功 **200**；同名 `checkpoint_id`（全局）已存在 **409**（先保存的那份保留）；未知或已结束会话 **404**；`checkpoint_id` 为空或纯空白 **422**。
 
 **恢复**：
@@ -2139,6 +2139,89 @@ python3 -c 'import json;a=json.load(open("/tmp/r1.json"));b=json.load(open("/tmp
 # True True
 ```
 
+### 修复说明：保存等待写锁期间同会话操作不得穿插
+
+**问题**：此前存档在会话锁内完成序列化后即释放会话锁，再在锁外写入 SQLite。若写库遇到 SQLite 写锁（其他写入占用数据库）而等待，同会话的操作会穿插先生效：游标 1000 的会话发起保存后写库被写锁阻塞，推进到 3000 的请求先完成，保存最终成功落库的却仍是游标 1000 的旧快照——保存响应在后、内容却是交错前的状态，恢复出的游标与会话实际进度脱节。
+
+**修复**：`PUT/POST /sessions/{session_id}/checkpoints/{checkpoint_id}` 与 `POST /sessions/{session_id}/checkpoints` 的**资格检查、状态采集与 SQLite 提交**（`BEGIN IMMEDIATE` 占用 `checkpoint_id`）改为在**同一次会话锁持锁内**完成。保存等待写锁期间，同会话的推进、隐藏切换、补取等操作在会话锁外排队、不得先完成；写锁释放（或写入失败）后它们才继续。写入失败由存储层回滚：不留新存档、不改会话或通道容量，等待中的操作随锁释放照常生效；同名存档仍 **409** 且原存档不变。保存条件（已开通道且自动播放非运行）、现有字段、响应、404/409/422 与恢复行为均不变；仍为单进程内存态 + 单文件 SQLite，不扩展多进程。回归测试见 `tests/test_checkpoint.py` 末尾“可控交错回归”一节（等写锁、提交失败、正常保存）。
+
+### 示例 35：保存等待写锁期间，同会话推进不穿插（可执行验证）
+
+下面的脚本可直接复制执行：在容器内临时持有 SQLite 写锁（模拟另一个写入者），验证保存等待期间同会话的推进不会先完成、恢复在提交前是 404，写锁释放后保存先落库（游标 1000）、推进随后生效（3000），恢复得到与保存响应一致的 1000。
+
+先准备场景、会话与通道，推进到 1000（3 条事件入队）：
+
+```bash
+curl -s -X PUT http://localhost:8080/scenes/scene-cp-lock \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "track_count": 2,
+    "expected_revision": 0,
+    "subtitles": [
+      {"id": "s1", "speaker": "Alice", "start_ms": 0,    "end_ms": 1000},
+      {"id": "s2", "speaker": "Bob",   "start_ms": 800,  "end_ms": 3000, "locked_track": 2},
+      {"id": "s3", "speaker": "Alice", "start_ms": 1000, "end_ms": 2500}
+    ]
+  }' >/dev/null
+
+SID=$(curl -s -X POST http://localhost:8080/sessions \
+  -H 'Content-Type: application/json' -d '{"scene_id": "scene-cp-lock"}' \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["session_id"])')
+curl -s -X POST http://localhost:8080/sessions/$SID/channel >/dev/null
+curl -s -X POST http://localhost:8080/sessions/$SID/events \
+  -H 'Content-Type: application/json' -d '{"time_ms": 1000}' >/dev/null
+```
+
+在容器内临时持有 SQLite 写锁约 8 秒（存档与场景同在 `SCENES_DB_PATH=/data/scenes.db`，保存的 `BEGIN IMMEDIATE` 将等待）：
+
+```bash
+docker compose exec -T subtitle-tracks python - <<'PY' &
+import sqlite3, time
+conn = sqlite3.connect("/data/scenes.db")
+conn.execute("BEGIN IMMEDIATE")
+time.sleep(8)
+conn.rollback()
+PY
+sleep 2  # 确保写锁已被持有
+```
+
+写锁持有期间发起保存与同会话推进，并在等待中尝试恢复：
+
+```bash
+# 保存遇到写锁等待：请求阻塞，直到写锁释放才提交
+curl -s -X PUT http://localhost:8080/sessions/$SID/checkpoints/cp-lock \
+  -w '\nsave:%{http_code}\n' &
+SAVE_PID=$!
+sleep 1
+# 同会话的推进不会先完成：它在会话锁外排队，直到保存结束才生效
+curl -s -X POST http://localhost:8080/sessions/$SID/events \
+  -H 'Content-Type: application/json' -d '{"time_ms": 3000}' \
+  -w '\nadvance:%{http_code}\n' &
+ADV_PID=$!
+sleep 1
+# 保存尚未提交：恢复按未知存档处理
+curl -s -o /dev/null -w 'restore-while-waiting:%{http_code}\n' \
+  -X POST http://localhost:8080/checkpoints/cp-lock/restore
+# restore-while-waiting:404
+
+wait $SAVE_PID
+# {"checkpoint_id":"cp-lock", ...,"cursor_ms":1000, ...}
+# save:200            <- 写锁释放后保存先完成，落库游标 1000
+wait $ADV_PID
+# {...,"cursor_ms":3000, ...}
+# advance:200         <- 推进随后生效到 3000
+```
+
+恢复得到与保存响应一致的游标 **1000**（而不是交错后的 3000）：
+
+```bash
+curl -s -X POST http://localhost:8080/checkpoints/cp-lock/restore \
+  | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d["cursor_ms"])'
+# 1000
+```
+
+要点：保存的等待（写锁）不再给同会话操作让路——推进响应一定在保存提交之后才生效；若保存最终失败，则不留存档、会话与通道容量不变，排队的推进照常完成。写入失败（如写锁等待超过 30 秒 `busy_timeout`）返回 500 并可原样重试。
+
 ## 本地开发与测试（不使用 Docker）
 
 需 Python 3.11+：
@@ -2176,7 +2259,7 @@ app/
   main.py      # FastAPI 路由与请求/响应模型（Pydantic 校验），含片段另存 /scenes/{id}/clip、场景拼接 /scenes/concat、会话结束 /sessions/{id}/finish、补取通道 /sessions/{id}/channel(/fetch)、自动播放 /sessions/{id}/autoplay/(start|pause|resume) 与播放存档 /sessions/{id}/checkpoints(/{cp_id})、/checkpoints/{cp_id}/restore
   solver.py    # 纯 Python 求解器与业务校验（无第三方依赖）
   storage.py   # 场景持久化：本地 SQLite（乐观锁版本控制；片段/拼接核对全部源版本与创建目标为同一事务；playback_checkpoints 表保存跨重启播放存档）
-  playback.py  # 播放会话：单进程内存态，推进/事件推进/临时隐藏说话人/补取通道/接纳/结束串行化（接纳含场景读取的完整操作；结束一次取回最终快照并移除注册表；通道记录全部 enter/exit 供丢响应后补取确认；CHANNEL_EVENT_LIMIT 共享容量随生产原子申请、确认前缀/结束释放）、自动播放（每 50ms 按单调时钟整批推进，满额转 blocked、确认后显式恢复，暂停/阻塞不计时、不追赶；状态机 idle/running/paused/blocked）、播放存档（锁内序列化完整状态；恢复为全新会话、队列计入共享容量、idle 保 idle/paused/blocked 转 paused 重新计时不追赶）与保轨重算
+  playback.py  # 播放会话：单进程内存态，推进/事件推进/临时隐藏说话人/补取通道/接纳/结束串行化（接纳含场景读取的完整操作；结束一次取回最终快照并移除注册表；通道记录全部 enter/exit 供丢响应后补取确认；CHANNEL_EVENT_LIMIT 共享容量随生产原子申请、确认前缀/结束释放）、自动播放（每 50ms 按单调时钟整批推进，满额转 blocked、确认后显式恢复，暂停/阻塞不计时、不追赶；状态机 idle/running/paused/blocked）、播放存档（资格检查、状态采集与 SQLite 提交在同一次会话锁持锁内完成，写库等待期间同会话操作不穿插；恢复为全新会话、队列计入共享容量、idle 保 idle/paused/blocked 转 paused 重新计时不追赶）与保轨重算
 tests/
   conftest.py            # pytest 夹具（场景接口使用临时数据库、会话隔离）
   test_solver.py         # 求解器单元测试
@@ -2190,7 +2273,7 @@ tests/
   test_channel.py        # 补取通道：开启/重复开启、三类操作入队与短字幕、ack 边界与不回退、重复补取不变、结束清除、404/409/422、串行化
   test_channel_limit.py  # 通道共享容量：默认/配置/非法拒绝启动、生产原子申请与满额 503（游标/隐藏集合/seq/队列不变）、无事件与未开启通道不占、确认前缀释放/读取与旧确认不释放、结束一次性释放、跨会话总额、并发不越限/不死锁/不泄漏、重试
   test_autoplay.py       # 自动播放：状态机 409/404、真实时间推进与本段起点、暂停不计时/恢复不追赶、满额整批转 blocked（游标/seq/队列不变）/确认后显式恢复、运行中手动推进 409、其他操作串行、结束停止驱动并释放容量（含注入时钟的确定性管理器测试）、启动/暂停恢复/阻塞恢复的等锁不计时回归（可控时钟 + 线程交错）与无竞争路径
-  test_checkpoint.py     # 播放存档：保存前置条件（已开通道/非 running）、同名 409、404/422、存档内容（快照/游标/隐藏/通道事件与序号边界）、恢复为新会话且不读场景、序号与确认边界保留、idle 保 idle/paused/blocked 转 paused、resume 重新计时不追赶、重复恢复独立、恢复 503 不留会话/占用、并发不超额、模拟重启后恢复、旧接口不变
+  test_checkpoint.py     # 播放存档：保存前置条件（已开通道/非 running）、同名 409、404/422、存档内容（快照/游标/隐藏/通道事件与序号边界）、恢复为新会话且不读场景、序号与确认边界保留、idle 保 idle/paused/blocked 转 paused、resume 重新计时不追赶、重复恢复独立、恢复 503 不留会话/占用、并发不超额、模拟重启后恢复、旧接口不变、保存等写锁/提交失败/正常保存的可控交错回归
 Dockerfile
 docker-compose.yml   # 挂载 scenes-data 具名卷到 /data（场景与播放存档同在 SCENES_DB_PATH 的 SQLite 中）；CHANNEL_EVENT_LIMIT 配置通道共享容量（默认 1024）
 requirements.txt / requirements-dev.txt
