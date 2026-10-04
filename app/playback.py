@@ -70,14 +70,17 @@
   之后一切请求 404。驱动状态仅存于本进程内存，不跨重启，旧接口响应不变。
 - 播放存档（checkpoint）：已开启补取通道且自动播放非运行状态的会话可在
   会话锁内把完整快照、游标、隐藏集合、通道未确认事件与
-  next_seq/acked_seq/max_returned_seq 序号边界序列化为存档负载（由调用方
-  写入 SQLite）；未开通道或自动播放运行中拒绝存档（CheckpointNotAllowed，
-  HTTP 409），序列化与同会话一切操作串行，成功不改变、不结束会话。恢复按
-  存档负载创建全新 session_id 的会话，不读取当前场景：队列按存档事件数
-  原子计入共享容量（不足 ChannelCapacityExhausted，503，不留会话或容量
-  占用，并发不超额）；idle 恢复为 idle，paused/blocked 恢复为 paused，
-  续播从保留游标重新计时、不追赶离线时间；同一份存档可重复恢复为互不
-  影响的独立会话，后续操作不修改存档或其他会话。
+  next_seq/acked_seq/max_returned_seq 序号边界序列化为存档负载；存档资格
+  检查、状态采集与调用方的 SQLite 提交在**同一次会话锁临界区内**完整完成
+  （提交以 commit 回调在锁内执行）——保存等待 SQLite 写锁期间，同会话的
+  其他操作在锁外排队、不得先完成，提交失败（含同名存档冲突）只需回滚
+  事务，会话侧没有任何已发生的变更。未开通道或自动播放运行中拒绝存档
+  （CheckpointNotAllowed，HTTP 409），成功不改变、不结束会话。恢复按存档
+  负载创建全新 session_id 的会话，不读取当前场景：队列按存档事件数原子
+  计入共享容量（不足 ChannelCapacityExhausted，503，不留会话或容量占用，
+  并发不超额）；idle 恢复为 idle，paused/blocked 恢复为 paused，续播从
+  保留游标重新计时、不追赶离线时间；同一份存档可重复恢复为互不影响的
+  独立会话，后续操作不修改存档或其他会话。
 
 会话只存在于本进程内存中，不随重启保留。同一会话上的推进、事件推进、
 隐藏切换、接纳、结束与补取通道的开启/补取通过会话级互斥锁串行化：
@@ -500,6 +503,13 @@ class PlaybackManager:
     会话锁时原子申请共享容量，finish 在会话锁内释放容量并取注册表锁
     移除条目；其余路径从不持有容量锁或注册表锁等待会话锁，因此不存在
     反向等待、不会死锁。
+
+    播放存档保存时，调用方的 SQLite 提交（commit 回调）也在会话锁内
+    执行：提交可能因数据库写锁而阻塞，在此期间同一会话的其他操作都在
+    会话锁外等待、不得穿插。SQLite 连接是调用方对象、不持有任何进程内
+    锁，提交过程不会反向等待会话锁，因此不构成锁序环；写锁竞争是跨
+    进程/跨连接的数据库层串行化（busy_timeout 内等待），不涉及本进程
+    的会话锁顺序。
     """
 
     def __init__(
@@ -798,20 +808,32 @@ class PlaybackManager:
     # 播放存档（checkpoint）：锁内序列化 / 恢复为新会话（队列计入共享容量）
     # ------------------------------------------------------------------
 
-    def checkpoint_state(self, session: PlaybackSession) -> Dict[str, Any]:
-        """在会话锁内把当前播放状态序列化为可持久化的存档负载。
+    def save_checkpoint(
+        self,
+        session: PlaybackSession,
+        checkpoint_id: str,
+        commit: Callable[[str, Dict[str, Any]], None],
+    ) -> Dict[str, Any]:
+        """保存播放存档：资格检查、状态采集与 SQLite 提交是同一次完整操作。
+
+        整个过程（含调用方传入的 commit 回调——通常是 SQLite 的
+        BEGIN IMMEDIATE 事务提交）都在会话锁内完成，与同会话的推进、事件
+        推进、隐藏切换、接纳、结束、通道开启/补取、自动播放控制完整串行：
+        保存因 SQLite 写锁而等待期间，同会话的其他操作只能在会话锁外排队，
+        绝不能先于本次保存生效（不会出现“存档里是旧游标、会话却已先推进”
+        的错配，也不会有等待中的操作随后读到未变化的状态）。
 
         仅允许**已开启补取通道且自动播放不处于 running** 的会话存档：
-        未开启通道抛 CheckpointNotAllowed(channel_missing)；运行中抛
-        CheckpointNotAllowed(autoplay_running)；会话已结束抛
-        SessionFinished（404）。本方法只做序列化、不写入存储（由调用方
-        落库）、不改变任何会话状态——成功存档不结束会话。
+        会话已结束抛 SessionFinished（404）；未开启通道抛
+        CheckpointNotAllowed(channel_missing)；运行中抛
+        CheckpointNotAllowed(autoplay_running)。
 
-        与同会话的推进、事件推进、隐藏切换、接纳、结束、通道开启/补取、
-        自动播放控制在会话锁内完整串行，因此序列化出的完整快照、游标、
-        隐藏集合、通道未确认事件与 next_seq/acked_seq/max_returned_seq
-        序号边界是同一份一致状态；随后的存储写入失败只需不落库即可，
-        会话侧没有任何需要回滚的变更。
+        本方法不修改任何会话状态——成功存档不结束会话。commit 在锁内执行：
+        提交失败（如同名存档冲突或 SQLite 写错误）时由 commit 自行回滚并
+        抛异常，会话侧没有任何已经发生的变更需要回滚，通道容量也不变；
+        会话锁随异常一并释放，等待中的同会话操作随后照常生效。
+
+        返回存档负载（调用方据此组装保存响应）。
         """
         with session.lock:
             if session.closed:
@@ -825,7 +847,7 @@ class PlaybackManager:
                     "autoplay_running", session.autoplay_status
                 )
             channel = session.channel
-            return {
+            payload = {
                 "scene_id": session.scene_id,
                 "source_revision": session.source_revision,
                 "track_count": session.track_count,
@@ -849,6 +871,9 @@ class PlaybackManager:
                     "max_returned_seq": channel.max_returned_seq,
                 },
             }
+            # SQLite 提交仍在会话锁内：写锁等待期间同会话操作不得穿插。
+            commit(checkpoint_id, payload)
+            return payload
 
     def restore_from_checkpoint(
         self,

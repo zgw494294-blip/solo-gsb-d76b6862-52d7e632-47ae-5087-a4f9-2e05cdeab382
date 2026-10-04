@@ -6,7 +6,8 @@
   未开通道或 running 返回 409；成功不结束会话、不改游标/隐藏/队列；
   同名存档 409（先存者保留、失败不留存档）；未知/已结束会话 404；
   非法 id（空/纯空白）422；存档含完整快照、游标、隐藏集合、通道事件
-  与 next_seq/acked_seq/max_returned_seq；与同会话操作串行。
+  与 next_seq/acked_seq/max_returned_seq；资格检查、状态采集与 SQLite
+  提交在同一会话锁临界区内完整串行（等写锁期间同会话操作不得穿插）。
 - 恢复（POST /checkpoints/{cp_id}/restore 及其别名）：
   按存档恢复为全新 session_id 的独立会话，不读取当前场景（场景删除、
   修订均不影响）；事件、序号、确认边界保留，新事件接着 next_seq 编号；
@@ -15,10 +16,14 @@
   或其他会话；响应含新 id、完整快照与播放状态。
 - 容量：恢复队列计入共享容量，不足 503 且不留会话或容量占用；
   并发恢复合计不超额；同名存档并发保存恰好一次成功。
+- 串行回归（可控交错）：等 SQLite 写锁期间同会话推进/结束不得先完成、
+  存档游标严格为序列化值；提交失败回滚不留存档/不改会话或通道容量并
+  释放等待操作；正常保存与同会话推进严格先后；同名存档 409 原存档不变。
 - 持久化：reset_playback（模拟进程重启）后原会话 404，存档仍可恢复；
   存档落在 SCENES_DB_PATH 的同一 SQLite。
 - 旧接口响应不变。
 """
+import os
 import threading
 
 import pytest
@@ -676,6 +681,338 @@ def test_save_serialized_with_session_operations():
         body = restore(client, f"cp-serial-{i}").json()
         assert body["cursor_ms"] in (1000, 3000)
         assert len(body["channel"]["events"]) == body["channel"]["next_seq"] - 1
+
+
+# ---------------------------------------------------------------------------
+# 可控交错回归：资格检查、状态采集与 SQLite 提交整体串行
+#
+# 缺陷场景：保存游标 1000 的会话时，SQLite 写锁让提交在锁外等待；修复前
+# 存档序列化后即释放会话锁，同会话的推进可在保存等待期间先到 3000——
+# 于是（a）等待期间按存档恢复得到 404（存档尚未提交），（b）保存最终
+# 成功后恢复出来的游标却是保存请求提交时的旧值 1000（与会话已推进到
+# 3000 的事实错配）。修复后资格检查、状态采集与 SQLite 提交在同一次
+# 会话锁临界区内完成：保存等待写锁期间，同会话的一切操作都必须排队、
+# 不得先完成。
+# ---------------------------------------------------------------------------
+
+
+def _open_write_lock_holder():
+    """打开一个持有 SQLite 保留写锁（BEGIN IMMEDIATE 未提交）的连接。
+
+    返回 (连接, 释放函数)：释放函数提交/回滚事务并关闭连接。连接自身
+    busy_timeout=0：它只是持锁方，不参与争锁；存档连接按仓库默认的
+    busy_timeout=30s 在锁上等待，测试随后及时放锁。
+    """
+    import sqlite3
+
+    db_path = os.environ["SCENES_DB_PATH"]
+    holder = sqlite3.connect(db_path, timeout=0)
+    holder.execute("PRAGMA busy_timeout=0")
+    holder.execute("BEGIN IMMEDIATE")
+
+    def release():
+        holder.rollback()
+        holder.close()
+
+    return holder, release
+
+
+def _wait_until_save_blocks(sid, timeout=10.0):
+    """轮询等待存档请求已持有会话锁（存档正在 SQLite 写锁上等待）。
+
+    存档一旦进入完整临界区即持有 session.lock；本函数反复尝试非阻塞
+    获取同一把锁，获取不到即证明保存正在持锁。**非阻塞获取一旦成功必须
+    立即释放**，否则本轮询线程会自己占住会话锁、让后续操作永久排队。
+    返回会话对象。
+    """
+    import time
+
+    pb = main_module.get_playback()
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        session = pb.get(sid)
+        if session is not None:
+            acquired = session.lock.acquire(blocking=False)
+            if not acquired:
+                return session
+            # 探测成功说明保存尚未持锁：立即归还，再继续轮询
+            session.lock.release()
+        time.sleep(0.005)
+    raise AssertionError("存档请求未在超时内持有会话锁（未进入提交等待）")
+
+
+def test_save_holds_session_lock_through_sqlite_write_lock_wait():
+    """等写锁期间同会话操作不得穿插：推进在锁外排队，存档提交后才生效；
+    存档落库的游标是序列化那一刻的值，提交后立即与会话一致。
+
+    交错用同一个 TestClient 发起（保存与等待中的推进），避免测试门户线程池
+    参与构造锁序环；存档等待期间只观察会话锁是否被持续持有，不发起其他可能
+    阻塞在 SQLite 上的 HTTP 请求。
+    """
+    client = make_client()
+    sid = prep_session_with_queued_events(client, "scene-cp-lockwait")
+    session = main_module.get_playback().get(sid)
+
+    # 另一会话在持锁前建好，用于存档释放后证明存档只阻塞同会话：
+    other_client = make_client()
+    other = create_session(other_client, "scene-cp-lockwait")
+
+    _, release_write_lock = _open_write_lock_holder()
+    responses = {}
+    t_save = t_events = None
+    try:
+        def do_save():
+            responses["save"] = save_cp(client, sid, "cp-lockwait")
+
+        t_save = threading.Thread(target=do_save)
+        t_save.start()
+
+        # 存档在 SQLite 写锁上等待，且仍持有会话锁：非阻塞取锁失败
+        _wait_until_save_blocks(sid)
+        assert not session.lock.acquire(blocking=False), "保存等待期间会话锁应被持有"
+        assert session.cursor_ms == 1000, "等待期间会话游标不得被穿插改动"
+
+        # 写锁未释放时存档尚未提交：直接读库（只读 SELECT，不与写锁竞争）
+        # 也查不到该存档——对应缺陷中的“保存等待期间恢复报 404”。
+        assert (
+            main_module.get_store().get_checkpoint("cp-lockwait") is None
+        ), "存档提交前不应能读到存档行"
+
+        def do_events():
+            responses["events"] = events(client, sid, 3000)
+
+        t_events = threading.Thread(target=do_events)
+        t_events.start()
+        try:
+            # 保存等待期间：同会话推进不得先完成
+            t_events.join(timeout=0.7)
+            assert t_events.is_alive(), "保存等待写锁期间，同会话推进不得先完成"
+            assert session.cursor_ms == 1000
+        finally:
+            release_write_lock()
+
+        t_save.join(timeout=10)
+        t_events.join(timeout=10)
+        assert not t_save.is_alive() and not t_events.is_alive()
+    finally:
+        # 防御性兜底：即便断言失败也要释放外部写锁，避免悬挂连接
+        try:
+            release_write_lock()
+        except Exception:
+            pass
+
+    # 串行次序：存档先（游标 1000），随后推进到 3000
+    assert responses["save"].status_code == 200
+    assert responses["save"].json()["cursor_ms"] == 1000
+    assert responses["events"].status_code == 200
+    assert responses["events"].json()["cursor_ms"] == 3000
+
+    # 存档释放后同会话的结束与既有 finish 语义一致：恰好一次成功，随后 404
+    assert client.post(f"/sessions/{sid}/finish").status_code == 200
+    assert events(client, sid, 3000).status_code == 404
+
+    # 另一会话完全不受影响（锁是会话级，不是全局串行点）
+    assert events(other_client, other, 900).status_code == 200
+    assert other_client.post(f"/sessions/{other}/finish").status_code == 200
+
+    # 保存成功后恢复：存档游标严格是 1000（修复前会在等待期间被推进穿插）
+    body = restore(client, "cp-lockwait").json()
+    assert body["cursor_ms"] == 1000
+    assert body["channel"]["next_seq"] == 4
+    assert [e["seq"] for e in body["channel"]["events"]] == [1, 2, 3]
+
+    # 存档仍可重复恢复为独立会话
+    again = restore(client, "cp-lockwait")
+    assert again.status_code == 200
+    assert again.json()["cursor_ms"] == 1000
+
+
+class _InjectedCommitFailure(Exception):
+    """测试专用：模拟 SQLite 提交阶段的写失败（存储层会回滚后原样抛出）。"""
+
+
+def test_save_commit_failure_rolls_back_and_releases_waiting_ops(monkeypatch):
+    """提交（写）失败：回滚不留新存档、不改会话游标/隐藏/通道与共享容量，
+    会话锁随即释放，等待中的同会话操作正常生效；该 id 随后仍可正常保存。
+
+    TestClient 默认会把未处理异常重新抛出，因此失败路径的存档请求使用
+    raise_server_exceptions=False 的客户端，拿到真实的 500 响应。
+    """
+    client = make_client()
+    sid = prep_session_with_queued_events(client, "scene-cp-commitfail")
+    pb = main_module.get_playback()
+    capacity = pb.channel_capacity
+    session = pb.get(sid)
+
+    store = main_module.get_store()
+    real_save = store.save_checkpoint
+    commit_entered = threading.Event()
+    allow_fail = threading.Event()
+
+    def failing_save(checkpoint_id, session_id, payload):
+        commit_entered.set()
+        assert allow_fail.wait(timeout=10), "测试未能及时放行提交失败"
+        raise _InjectedCommitFailure("模拟提交阶段写失败（如 SQLite I/O 错误）")
+
+    monkeypatch.setattr(store, "save_checkpoint", failing_save)
+
+    responses = {}
+    failing_client = TestClient(app, raise_server_exceptions=False)
+
+    def do_save(cp_id):
+        return save_cp(failing_client, sid, cp_id)
+
+    t_save = threading.Thread(
+        target=lambda: responses.setdefault("save", do_save("cp-fail"))
+    )
+    t_save.start()
+    assert commit_entered.wait(timeout=10), "存档未进入提交回调"
+    # 已进入提交回调即持有会话锁
+    assert not session.lock.acquire(blocking=False)
+
+    def do_events():
+        responses["events"] = events(client, sid, 3000)
+
+    t_events = threading.Thread(target=do_events)
+    t_events.start()
+    try:
+        # 失败落地前（仍在会话锁临界区），等待中的推进不得被释放
+        t_events.join(timeout=0.7)
+        assert t_events.is_alive(), "提交失败落地前，等待中的操作不应被释放"
+        assert session.cursor_ms == 1000
+    finally:
+        allow_fail.set()
+    t_save.join(timeout=10)
+    t_events.join(timeout=10)
+    assert not t_save.is_alive() and not t_events.is_alive()
+
+    # 提交失败 -> 500（写错误，不由本接口翻译成 4xx）；等待中的推进随后完成
+    assert responses["save"].status_code == 500
+    assert responses["events"].status_code == 200
+    assert responses["events"].json()["cursor_ms"] == 3000
+
+    # 不留新存档
+    assert restore(client, "cp-fail").status_code == 404
+    # 会话仍在（未结束），通道容量只反映真实入队（3000 窗口新增 2 条）
+    assert pb.get(sid) is not None
+    assert capacity.used == 5
+    fetch_resp = fetch(client, sid, 0)
+    assert [e["seq"] for e in fetch_resp.json()["events"]] == [1, 2, 3, 4, 5]
+
+    # 恢复真实提交路径后，同一 checkpoint_id 可正常保存（失败未占用 id），
+    # 且这次取到推进后的当前状态（游标 3000、序号到 5）
+    monkeypatch.setattr(store, "save_checkpoint", real_save)
+    resp = do_save("cp-fail")
+    assert resp.status_code == 200
+    assert resp.json()["cursor_ms"] == 3000
+    assert resp.json()["next_seq"] == 6
+    body = restore(client, "cp-fail").json()
+    assert body["cursor_ms"] == 3000
+    assert body["channel"]["next_seq"] == 6
+
+
+def test_normal_save_interleaved_with_advance_serializes_cleanly(monkeypatch):
+    """正常保存（无写锁竞争）与同会话推进可控交错：保存持锁的整个区间内
+    推进必须等待；保存响应、随后会话状态与可恢复存档严格自洽。"""
+    client = make_client()
+    sid = prep_session_with_queued_events(client, "scene-cp-normal-interleave")
+    session = main_module.get_playback().get(sid)
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    store = main_module.get_store()
+    real_save = store.save_checkpoint
+
+    def gated_save(checkpoint_id, session_id, payload):
+        entered.set()
+        assert release.wait(timeout=10), "测试未能及时放行被阻塞的存档提交"
+        return real_save(checkpoint_id, session_id, payload)
+
+    monkeypatch.setattr(store, "save_checkpoint", gated_save)
+
+    responses = {}
+
+    def do_save():
+        responses["save"] = save_cp(client, sid, "cp-normal-interleave")
+
+    t_save = threading.Thread(target=do_save)
+    t_save.start()
+    assert entered.wait(timeout=10), "存档未进入提交"
+    # 存档此刻持有会话锁：直接非阻塞取锁失败
+    assert not session.lock.acquire(blocking=False)
+
+    def do_events():
+        responses["events"] = events(client, sid, 3000)
+
+    t_events = threading.Thread(target=do_events)
+    t_events.start()
+    try:
+        t_events.join(timeout=0.7)
+        assert t_events.is_alive(), "保存临界区内同会话推进不得先完成"
+        assert session.cursor_ms == 1000
+    finally:
+        release.set()
+    t_save.join(timeout=10)
+    t_events.join(timeout=10)
+
+    assert responses["save"].status_code == 200
+    assert responses["save"].json()["cursor_ms"] == 1000
+    assert responses["events"].status_code == 200
+    assert responses["events"].json()["cursor_ms"] == 3000
+    # 存档是保存那一刻（1000）的一致状态；恢复不会读到穿插后的 3000
+    body = restore(client, "cp-normal-interleave").json()
+    assert body["cursor_ms"] == 1000
+    assert body["channel"]["next_seq"] == 4
+    assert [e["seq"] for e in body["channel"]["events"]] == [1, 2, 3]
+
+
+def test_duplicate_name_during_waiting_save_leaves_original_intact():
+    """同名存档 409 路径同样在会话锁内提交：原存档不变、会话与通道容量
+    不变、等待中的同会话操作在 409 返回后被释放。"""
+    client = make_client()
+    sid = prep_session_with_queued_events(client, "scene-cp-dup-wait")
+    # 先存一份 cp-dup-wait（游标 1000）
+    assert save_cp(client, sid, "cp-dup-wait").status_code == 200
+    pb = main_module.get_playback()
+    used_before = pb.channel_capacity.used
+    session = pb.get(sid)
+
+    _, release_write_lock = _open_write_lock_holder()
+    responses = {}
+    try:
+        def do_save():
+            responses["dup"] = save_cp(client, sid, "cp-dup-wait")
+
+        t_save = threading.Thread(target=do_save)
+        t_save.start()
+        _wait_until_save_blocks(sid)
+
+        def do_events():
+            responses["events"] = events(client, sid, 3000)
+
+        t_events = threading.Thread(target=do_events)
+        t_events.start()
+        t_events.join(timeout=0.7)
+        assert t_events.is_alive(), "同名存档提交等待期间推进不得先完成"
+        assert session.cursor_ms == 1000
+    finally:
+        release_write_lock()
+
+    t_save.join(timeout=10)
+    t_events.join(timeout=10)
+    assert responses["dup"].status_code == 409
+    assert responses["dup"].json()["detail"]["checkpoint_id"] == "cp-dup-wait"
+    assert responses["events"].status_code == 200
+
+    # 通道容量只反映推进真实入队（3 + 3000 窗口 2 = 5），同名存档失败不占容量。
+    # 在恢复之前核对——恢复本身会为恢复队列计入共享容量。
+    assert pb.channel_capacity.used == used_before + 2
+
+    # 原存档内容不变（仍是第一次保存的游标 1000，不被重复请求覆盖）
+    body = restore(client, "cp-dup-wait").json()
+    assert body["cursor_ms"] == 1000
+    assert body["channel"]["next_seq"] == 4
 
 
 # ---------------------------------------------------------------------------

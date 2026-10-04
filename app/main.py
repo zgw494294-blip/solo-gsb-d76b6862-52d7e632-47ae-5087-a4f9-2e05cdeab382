@@ -73,16 +73,19 @@ app = FastAPI(
         "的两种手动推进 409，其他既有会话操作仍可用并完整串行；驱动状态仅存"
         "单进程内存，旧接口响应不变。"
         "已开补取通道且自动播放未运行的会话还可按 session_id 与非空 "
-        "checkpoint_id 保存 SQLite 播放存档：存档含完整快照、游标、隐藏集合、"
-        "通道未确认事件与 next_seq/acked_seq/max_returned_seq 序号边界，与同"
-        "会话操作串行，成功不结束会话、失败不留存档；未开通道或自动播放运行"
-        "中返回 409，同名存档 409，未知会话 404，非法 id 422。按存档可恢复"
+        "checkpoint_id 保存 SQLite 播放存档：资格检查、状态采集（完整快照、"
+        "游标、隐藏集合、通道未确认事件与 next_seq/acked_seq/max_returned_seq "
+        "序号边界）与 SQLite 提交在同一次会话锁临界区内完整串行——保存等待 "
+        "SQLite 写锁期间同会话操作在锁外排队、不得先完成；成功不结束会话，"
+        "提交失败回滚不留存档、不改会话或通道容量并释放等待中的操作；"
+        "未开通道或自动播放运行中返回 409，同名存档 409 且原存档不变，"
+        "未知会话 404，非法 id 422。按存档可恢复"
         "为全新 session_id 的独立会话（不读取当前场景）：队列计入共享容量，"
-        "不足 503 且不留会话或容量占用，并发不超额；事件、序号与确认边界保留，"
-        "idle 仍为 idle、paused/blocked 恢复为 paused，续播重新计时、不追赶"
-        "离线时间；存档可重复恢复，后续操作不改存档或其他会话。"
+        "不足 503 且不留会话或容量占用，并发不超额；事件、序号与确认边界"
+        "保留，idle 仍为 idle、paused/blocked 恢复为 paused，续播重新计时、"
+        "不追赶离线时间；存档可重复恢复，后续操作不改存档或其他会话。"
     ),
-    version="1.11.0",
+    version="1.12.0",
 )
 
 
@@ -1486,14 +1489,30 @@ def _check_checkpoint_id(checkpoint_id: str) -> None:
 def _save_checkpoint_core(session_id: str, checkpoint_id: str) -> dict:
     """存档保存的公共实现（供具名 PUT/POST 与集合式 POST 共用）。
 
-    与同会话的一切操作在会话锁内串行序列化；序列化成功后写入 SQLite
-    （BEGIN IMMEDIATE 占用 checkpoint_id），写入失败时会话侧没有任何
-    变更，因此失败天然“不留存档、不改会话”。成功不结束会话。
+    存档资格检查、会话状态采集与 SQLite 提交是**同一次完整操作**：三者
+    都在播放管理器的会话锁内完成（提交以回调在锁内执行）。保存因 SQLite
+    写锁而等待时，同会话的推进/事件推进/隐藏切换/接纳/结束/通道/自动
+    播放控制只能在会话锁外排队，绝不会在保存等待期间先完成——因此存档
+    负载与提交时点的会话状态必然一致，等待期间不会被读到旧游标的会话。
+
+    成功不结束会话、会话与通道容量无任何变化。提交失败（同名存档冲突
+    或其他 SQLite 写错误）由存储层回滚：没有新存档落库，会话侧也没有
+    任何已发生的变更，会话锁释放后等待中的操作照常生效。
     """
     _check_checkpoint_id(checkpoint_id)
     session = _get_session_or_404(session_id)
+
+    def commit(cp_id: str, payload: dict) -> None:
+        get_store().save_checkpoint(
+            checkpoint_id=cp_id,
+            session_id=session_id,
+            payload=payload,
+        )
+
     try:
-        payload = get_playback().checkpoint_state(session)
+        payload = get_playback().save_checkpoint(
+            session, checkpoint_id, commit
+        )
     except SessionFinished:
         # 已取得引用但轮到生效时会话已被结束：与未知会话同等待遇
         raise _session_gone_404(session_id)
@@ -1510,14 +1529,8 @@ def _save_checkpoint_core(session_id: str, checkpoint_id: str) -> dict:
                 "checkpoint_id": checkpoint_id,
             },
         )
-
-    try:
-        get_store().save_checkpoint(
-            checkpoint_id=checkpoint_id,
-            session_id=session_id,
-            payload=payload,
-        )
     except CheckpointExists:
+        # 同名存档：存储事务已回滚，先存的那份保留；会话未被改动。
         raise HTTPException(
             status_code=409,
             detail={
@@ -1556,9 +1569,11 @@ def save_session_checkpoint(
 ) -> CheckpointSaveResponse:
     """按 session_id 与 checkpoint_id 保存 SQLite 播放存档。
 
-    存档在会话锁内序列化，包含完整快照（字幕/分轨/changes/source_revision/
-    track_count）、游标、隐藏集合、补取通道未确认事件及
-    next_seq、acked_seq、max_returned_seq 序号边界，与同会话操作串行。
+    存档资格检查（已开通道、自动播放非 running、会话未结束）、状态采集
+    （完整快照、游标、隐藏集合、补取通道未确认事件及 next_seq/acked_seq/
+    max_returned_seq 序号边界）与 SQLite 提交是**同一次完整操作**：全部
+    在会话锁内完成，因此保存因数据库写锁而等待时，同会话的其他操作只能
+    在锁外排队、不会先完成，落库内容与提交时点的会话状态必然一致。
     存档写入与场景同一个 SQLite（同一具名数据卷，跨容器重启可读）。
 
     - 仅**已开启补取通道且自动播放不处于运行状态**（idle/paused/blocked）
@@ -1567,7 +1582,8 @@ def save_session_checkpoint(
     - 成功 **200** 不结束会话：原会话、游标、隐藏集合与通道队列完全不变；
     - checkpoint_id 为空或纯空白返回 **422**；未知或已结束会话返回 **404**；
       同名存档返回 **409**（先存的那份保留，本次失败不留存档）；
-    - 任何失败都不改会话、不留存档（通道容量也不变化）。
+    - 任何失败都由存储事务回滚：不留新存档、不改会话或通道容量，会话锁
+      释放后等待中的同会话操作照常生效。
     """
     return CheckpointSaveResponse(
         **_save_checkpoint_core(session_id, checkpoint_id)
